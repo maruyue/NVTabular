@@ -67,7 +67,6 @@ class TensorItr:
     def __init__(self, tensors, batch_size=1, pin_memory=False, shuffle=False):
         self.tensors = tensors
         self.batch_size = batch_size
-
         self.num_samples = self.tensors[0].size(0)
         if shuffle:
             self.shuffle()
@@ -218,20 +217,12 @@ class TorchTensorBatchFileItr(torch.utils.data.IterableDataset):
         return self.num_chunks
 
     def __iter__(self):
-        buff = queue.Queue(1)
-        threading.Thread(target=self.load_chunk, args=(buff,)).start()
-        for _ in range(self.num_chunks):
-            chunk = buff.get()
-            yield from TensorItr(
-                chunk, batch_size=self.batch_size,
-            )
-
-    def load_chunk(self, out):
         for chunk in self.itr:
-            chunk = create_tensors_plain(
-                chunk, cat_cols=self.cat_cols, cont_cols=self.cont_cols, label_cols=self.label_cols
-            )
-            out.put(chunk)
+            yield chunk
+            #yield create_tensors_plain(
+            #    chunk, cat_cols=self.cat_cols, cont_cols=self.cont_cols, label_cols=self.label_cols
+            #)
+
 
 
 class DLCollator:
@@ -283,6 +274,81 @@ class TorchTensorBatchDatasetItr(torch.utils.data.ChainDataset):
 
     def __len__(self):
         return self.rows
+
+
+class AsyncTensorBatchDatasetItr(torch.utils.data.IterableDataset):
+    def __init__(self, paths, transform=None, **kwargs):
+        if isinstance(paths, str):
+            paths = [paths]
+        if not isinstance(paths, list):
+            raise TypeError("paths must be a string or a list.")
+        if len(paths) < 1:
+            raise ValueError("len(paths) must be > 0.")
+        self.paths = paths
+        # default to batch_size of 1
+        self.batch_size = kwargs.get("sub_batch_size", 1)
+        self.cats = kwargs.get("cats")
+        self.conts = kwargs.get("conts")
+        self.labels = kwargs.get("labels")
+        self.num_chunks = kwargs.get("num_chunks", 3)
+        self.shuffle = kwargs.get("shuffle", False)
+        self.itr = TorchTensorBatchDatasetItr(self.paths, **kwargs)
+
+    def __iter__(self):
+        #buff = queue.Queue(1)
+        buff = GdfQueue(3, self.cats, self.conts, self.labels, shuffle=self.shuffle)
+        threading.Thread(target=self.load_chunk, args=(buff,)).start()
+        while True:
+            chunk = buff.get()
+            if isinstance(chunk, str):
+                return
+            yield from TensorItr(
+                chunk, batch_size=self.batch_size,
+            )
+
+    def load_chunk(self, buff):
+        for chunk in self.itr:
+            buff.put(chunk)
+        buff.put('end')
+
+
+class GdfQueue:
+    def __init__(self, num_chunks, cats, conts, labels, shuffle=False):
+        self.queue_in = queue.Queue(num_chunks)
+        self.queue_out = queue.Queue(1)
+        self.num_chunks = num_chunks
+        self.shuffle = shuffle
+        self.cats, self.conts, self.labels = cats, conts, labels
+        self.chunks = []
+
+    def put(self, obj):
+        # use this for queue up lock
+        if isinstance(obj, str):
+            self.create_new_chunk()
+            self.queue_out.put(obj)
+            return
+        self.queue_in.put(obj)
+        if self.queue_in.qsize() >= self.num_chunks:
+            self.create_new_chunk()
+    
+    def create_new_chunk(self):
+        if self.queue_in.qsize() < 1:
+            return
+        chunks = []
+        for _ in range(self.queue_in.qsize()):
+            chunks.append(self.queue_in.get())
+        chunk = cudf.core.reshape.concat(chunks, axis=0, ignore_index=True)
+        del chunks
+        if self.shuffle:
+            # perform shuffle on multichunk chunk
+            pass
+        chunk = create_tensors_plain(
+                chunk, cat_cols=self.cats, cont_cols=self.conts, label_cols=self.labels
+            )
+        self.queue_out.put(chunk)
+
+    def get(self):
+        return self.queue_out.get()
 
 
 class DLDataLoader(torch.utils.data.DataLoader):
